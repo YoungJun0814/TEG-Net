@@ -71,11 +71,14 @@ class TEGNet_TermStructure(nn.Module):
         """
         Args:
             x: Input sequence [Batch, Seq_Len, Features]
-            entropy: Calculated entropy of the sequence [Batch, 1]
         
         Returns:
             out: Predicted values [Batch, output_dim]
         """
+        # Calculate entropy (std of VIX sequence) - acts as Regime Indicator
+        # VIX is the first feature (index 0)
+        vix_seq = x[:, :, 0]  # [Batch, Seq_Len]
+        entropy = torch.std(vix_seq, dim=1, keepdim=True)  # [Batch, 1]
         # LSTM Forward pass (2-layer)
         _, (h_t, _) = self.lstm_trend(x)  # h_t: [2, Batch, hidden_dim]
         _, (h_c, _) = self.lstm_chaos(x)  # h_c: [2, Batch, hidden_dim]

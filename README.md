@@ -23,23 +23,36 @@ The architecture consists of two specialized LSTM streams gated by an Entropy me
 
 ```mermaid
 graph TD
-    Input[VIX Term Structure Input] --> Trend[Trend Expert (LSTM)]
-    Input --> Chaos[Chaos Expert (LSTM)]
-    Input --> Entropy[Entropy Calculation]
+    %% Nodes
+    Input["VIX Term Structure Input"]
+    Trend["Trend Expert (LSTM)"]
+    Chaos["Chaos Expert (LSTM)"]
+    Entropy["Entropy Calculation"]
+    Gate["Entropy Gate (Neural Network)"]
+    Alpha["Regime Weight Alpha"]
+    OutT["Trend Prediction"]
+    OutC["Chaos Prediction"]
+    Fusion(("Adaptive Fusion"))
+    Output["Final VIX Forecast"]
+
+    %% Connections
+    Input --> Trend
+    Input --> Chaos
+    Input --> Entropy
     
-    Entropy --> Gate[Entropy Gate (Neural Network)]
-    Gate --> Alpha[Regime Weight Alpha]
+    Entropy --> Gate
+    Gate --> Alpha
     
-    Trend --> |Linear| OutT[Trend Prediction]
-    Chaos --> |Linear| OutC[Chaos Prediction]
+    Trend --> |Linear| OutT
+    Chaos --> |Linear| OutC
     
-    Alpha --> Fusion((Adaptive Fusion))
+    Alpha --> Fusion
     OutT --> Fusion
     OutC --> Fusion
     
-    Fusion --> Output[Final VIX Forecast]
+    Fusion --> Output
     
-    Input -.-> |Residual Connection| Output
+    Input -.-> |"Residual Connection"| Output
 ```
 
 ---

@@ -99,12 +99,8 @@ def run_pipeline():
         for x_batch, y_batch in train_loader:
             optimizer.zero_grad()
             
-            # Calculate entropy (std of VIX sequence)
-            vix_seq = x_batch[:, :, 0]  # [Batch, Seq_Len]
-            entropy_input = torch.std(vix_seq, dim=1, keepdim=True)  # [Batch, 1]
-            
             # Forward pass
-            preds = model(x_batch, entropy_input)
+            preds = model(x_batch)
             
             # Loss calculation with physics constraints
             loss = loss_fn(preds, y_batch, x_batch[:, -1, :])
@@ -126,12 +122,8 @@ def run_pipeline():
     
     model.eval()
     with torch.no_grad():
-        # Calculate test entropy
-        test_vix_seq = X_test_t[:, :, 0]
-        test_entropy = torch.std(test_vix_seq, dim=1, keepdim=True)
-        
         # Get predictions
-        test_preds = model(X_test_t, test_entropy).cpu().numpy()
+        test_preds = model(X_test_t).cpu().numpy()
     
     # Inverse transform to original scale
     dummy_pred = np.zeros((len(test_preds), 4))
