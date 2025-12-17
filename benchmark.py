@@ -1,3 +1,10 @@
+import os
+
+# [CRITICAL] Completely hide the GPU from the system.
+# This forces PyTorch to use the CPU, preventing crashes caused by 
+# the incompatibility between the current PyTorch version and the RTX 5070 (sm_120).
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,9 +14,8 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 import xgboost as xgb
-import os
 
-# Import our TEG-Net components
+# Import custom modules from src
 from src.data_loader import get_vix_term_structure
 from src.models import TEGNet_TermStructure
 from src.physics_loss import ReactionDiffusionLoss
@@ -18,8 +24,11 @@ from src.physics_loss import ReactionDiffusionLoss
 # 1. Define Benchmark Models
 # ==========================================
 
-# A. Vanilla LSTM (No Physics, No Gate)
 class VanillaLSTM(nn.Module):
+    """
+    Standard LSTM model without Physics-Informed Loss or Entropy Gating.
+    Acts as a baseline to demonstrate the impact of TEG-Net's innovations.
+    """
     def __init__(self, input_dim=4, hidden_dim=64, output_dim=3):
         super(VanillaLSTM, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
@@ -29,8 +38,11 @@ class VanillaLSTM(nn.Module):
         _, (h_n, _) = self.lstm(x)
         return self.fc(h_n[-1])
 
-# B. Time-Series Transformer (Simple Version)
 class TimeSeriesTransformer(nn.Module):
+    """
+    Basic Transformer encoder for time-series forecasting.
+    Represents the current SOTA (State-of-the-Art) architecture.
+    """
     def __init__(self, input_dim=4, d_model=64, nhead=4, num_layers=2, output_dim=3):
         super(TimeSeriesTransformer, self).__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -40,9 +52,8 @@ class TimeSeriesTransformer(nn.Module):
     
     def forward(self, x):
         x = self.input_proj(x)
-        # Add simple positional encoding (optional but good for transformer)
         output = self.transformer_encoder(x)
-        # Use the last time step's output
+        # Use the output of the last time step
         return self.fc(output[:, -1, :])
 
 # ==========================================
@@ -51,10 +62,15 @@ class TimeSeriesTransformer(nn.Module):
 
 SEQ_LEN = 20
 HORIZON = 5
-EPOCHS = 50  # Comparison models train faster
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+EPOCHS = 50  
+# [FIX] Explicitly define the device as CPU to avoid GPU kernel errors.
+DEVICE = torch.device('cpu') 
+print(f">>> Force Device: {DEVICE} (Due to RTX 5070 Compatibility)")
 
 def create_sequences(data, seq_len, horizon):
+    """
+    Prepares sliding window sequences for time-series training.
+    """
     X, Y = [], []
     for i in range(len(data) - seq_len - horizon + 1):
         X.append(data[i:i+seq_len])
@@ -62,8 +78,12 @@ def create_sequences(data, seq_len, horizon):
     return np.array(X), np.array(Y)
 
 def train_torch_model(model, X_train, Y_train, name="Model"):
+    """
+    Generic training loop for PyTorch benchmark models (LSTM, Transformer).
+    Uses standard MSE Loss.
+    """
     print(f">>> Training {name}...")
-    criterion = nn.MSELoss() # Benchmarks utilize standard MSE
+    criterion = nn.MSELoss() 
     optimizer = optim.Adam(model.parameters(), lr=0.005)
     
     dataset = torch.utils.data.TensorDataset(X_train, Y_train)
@@ -73,10 +93,7 @@ def train_torch_model(model, X_train, Y_train, name="Model"):
     for epoch in range(EPOCHS):
         for batch_x, batch_y in loader:
             optimizer.zero_grad()
-            if name == "Transformer": # Transformers need dummy mask handling sometimes
-                preds = model(batch_x)
-            else:
-                preds = model(batch_x)
+            preds = model(batch_x)
             loss = criterion(preds, batch_y)
             loss.backward()
             optimizer.step()
@@ -87,67 +104,104 @@ def train_torch_model(model, X_train, Y_train, name="Model"):
 # ==========================================
 
 def run_benchmark():
-    # Load Data
+    # 1. Load Data
     df = get_vix_term_structure()
     if df is None: return
     
+    # 2. Preprocessing
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(df.values)
     X, Y = create_sequences(scaled_data, SEQ_LEN, HORIZON)
     
+    # Train/Test Split (80% / 20%)
     split = int(len(X) * 0.8)
     X_train, X_test = X[:split], X[split:]
     Y_train, Y_test = Y[:split], Y[split:]
     
-    # Tensor Conversion
+    # Tensor Conversion (Sent to CPU)
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32).to(DEVICE)
     X_test_t = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
     
     results = {}
     
-    # --- 1. TEG-Net (Ours) ---
+    # --- Model 1: TEG-Net (Ours) ---
     print(">>> [1/4] Training TEG-Net (Ours)...")
-    teg_net = TEGNet_TermStructure(input_dim=4, hidden_dim=64, output_dim=3).to(DEVICE)
-    # Using the Calibrated Squeeze Loss settings
-    criterion_physics = ReactionDiffusionLoss(diff_coeff=0.01, react_coeff=5.0, crisis_threshold=0.25)
+    teg_net = TEGNet_TermStructure(input_dim=4, hidden_dim=64, output_dim=3, dropout=0.2).to(DEVICE)
+    
+    # Improved physics loss with softened weights
+    criterion_physics = ReactionDiffusionLoss(diff_coeff=0.01, react_coeff=1.0, crisis_threshold=0.25)
+    
+    # Optimizer with slightly higher LR (scheduler will reduce it)
     opt_teg = optim.Adam(teg_net.parameters(), lr=0.01)
     
-    for epoch in range(100): # Ours needs more epochs for physics
-        opt_teg.zero_grad()
-        entropy = torch.std(X_train_t[:, :, 0], dim=1, keepdim=True)
-        preds = teg_net(X_train_t, entropy)
-        loss = criterion_physics(preds, Y_train_t, X_train_t[:, -1, :])
-        loss.backward()
-        opt_teg.step()
+    # Learning Rate Scheduler: Reduce LR when loss plateaus
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt_teg, mode='min', factor=0.5, patience=20, verbose=False)
+    
+    # Mini-batch DataLoader
+    train_dataset = torch.utils.data.TensorDataset(X_train_t, Y_train_t)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
+    
+    teg_net.train()
+    for epoch in range(200):  # Increased from 100 to 200
+        epoch_loss = 0.0
+        for batch_x, batch_y in train_loader:
+            opt_teg.zero_grad()
+            
+            # Calculate entropy for this batch
+            entropy = torch.std(batch_x[:, :, 0], dim=1, keepdim=True)
+            
+            # Forward pass
+            preds = teg_net(batch_x, entropy)
+            
+            # Loss with physics constraints
+            loss = criterion_physics(preds, batch_y, batch_x[:, -1, :])
+            
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(teg_net.parameters(), max_norm=1.0)
+            
+            opt_teg.step()
+            epoch_loss += loss.item()
         
+        # Step scheduler based on epoch loss
+        avg_loss = epoch_loss / len(train_loader)
+        scheduler.step(avg_loss)
+        
+        # Progress log every 50 epochs
+        if (epoch + 1) % 50 == 0:
+            current_lr = opt_teg.param_groups[0]['lr']
+            print(f"    Epoch [{epoch+1}/200] Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
+    
     teg_net.eval()
     with torch.no_grad():
         ent_test = torch.std(X_test_t[:, :, 0], dim=1, keepdim=True)
         results['TEG-Net'] = teg_net(X_test_t, ent_test).cpu().numpy()
 
-    # --- 2. Vanilla LSTM ---
+
+    # --- Model 2: Vanilla LSTM ---
     lstm_model = VanillaLSTM().to(DEVICE)
     lstm_model = train_torch_model(lstm_model, X_train_t, Y_train_t, "Vanilla LSTM")
     lstm_model.eval()
     with torch.no_grad():
         results['LSTM'] = lstm_model(X_test_t).cpu().numpy()
 
-    # --- 3. Transformer ---
+    # --- Model 3: Transformer ---
     trans_model = TimeSeriesTransformer().to(DEVICE)
     trans_model = train_torch_model(trans_model, X_train_t, Y_train_t, "Transformer")
     trans_model.eval()
     with torch.no_grad():
         results['Transformer'] = trans_model(X_test_t).cpu().numpy()
 
-    # --- 4. XGBoost ---
+    # --- Model 4: XGBoost ---
     print(">>> [4/4] Training XGBoost...")
-    # XGBoost requires 2D input (flatten time steps)
+    # XGBoost requires flattened 2D input
     X_train_xgb = X_train.reshape(X_train.shape[0], -1)
     X_test_xgb = X_test.reshape(X_test.shape[0], -1)
     
-    # Train separate models for VIX 1M, 3M, 6M
     xgb_preds = []
+    # Train separate regressors for each target (1M, 3M, 6M)
     for i in range(3):
         reg = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1)
         reg.fit(X_train_xgb, Y_train[:, i])
@@ -159,31 +213,30 @@ def run_benchmark():
     # 4. Visualization & Metrics
     # ==========================================
     
-    # Prepare Ground Truth
+    # Prepare Ground Truth for plotting
     dummy_real = np.zeros((len(Y_test), 4))
     dummy_real[:, :3] = Y_test
     real_targets = scaler.inverse_transform(dummy_real)[:, :3]
 
     plt.figure(figsize=(15, 8))
-    plt.plot(real_targets[:, 0], label='Actual VIX', color='black', linewidth=2, alpha=0.6)
+    plt.plot(real_targets[:, 0], label='Actual VIX', color='black', linewidth=2, alpha=0.5)
     
     colors = {'TEG-Net': 'red', 'LSTM': 'blue', 'Transformer': 'green', 'XGBoost': 'orange'}
     styles = {'TEG-Net': '-', 'LSTM': '--', 'Transformer': '-.', 'XGBoost': ':'}
+    widths = {'TEG-Net': 2.0, 'LSTM': 1.0, 'Transformer': 1.0, 'XGBoost': 1.0}
     
     print("\n>>> [Benchmark Results - RMSE]")
     for name, pred in results.items():
-        # Inverse Scale
+        # Inverse Scale predictions
         dummy_pred = np.zeros((len(pred), 4))
         dummy_pred[:, :3] = pred
         real_pred = scaler.inverse_transform(dummy_pred)[:, :3]
         
-        # Calculate RMSE
         rmse = np.sqrt(mean_squared_error(real_targets, real_pred))
         print(f"    {name}: {rmse:.4f}")
         
-        # Plot
         plt.plot(real_pred[:, 0], label=f'{name} (RMSE: {rmse:.2f})', 
-                 color=colors[name], linestyle=styles[name], linewidth=1.5)
+                 color=colors[name], linestyle=styles[name], linewidth=widths[name])
 
     plt.title("Benchmark Comparison: TEG-Net vs State-of-the-Art Models")
     plt.xlabel("Time (Days)")
@@ -191,9 +244,10 @@ def run_benchmark():
     plt.legend()
     plt.grid(True, alpha=0.3)
     
+    save_path = "img/benchmark_result.png"
     if not os.path.exists('img'): os.makedirs('img')
-    plt.savefig("img/benchmark_result.png")
-    print(">>> Benchmark graph saved to 'img/benchmark_result.png'")
+    plt.savefig(save_path)
+    print(f">>> Benchmark graph saved to '{save_path}'")
     plt.show()
 
 if __name__ == "__main__":

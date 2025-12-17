@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data
+*.csv
+*.xlsx
+*.parquet
+
+# VS Code
+.vscode/
+
+# Environment
+.env
+venv/
+env/
+.anaconda/
+
+# Project Specific
+img/
+!img/forecast_result_pytorch.png
+!img/benchmark_result.png
+!img/regime_analysis.png
+teg_net.pth

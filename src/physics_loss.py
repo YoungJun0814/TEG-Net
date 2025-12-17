@@ -1,73 +1,121 @@
 import torch
 import torch.nn as nn
 
+
 class ReactionDiffusionLoss(nn.Module):
     """
-    [Balanced Squeeze Loss]
+    Physics-Informed Loss Function - Improved Version
     
-    Adjusted to prevent overshooting while maintaining reactivity.
-    The previous 'Nuclear Option' (200x) caused the model to predict unrealistic spikes (>75).
-    We calibrate the penalties to a 'Strong but Reasonable' level.
-    
-    Strategy:
-    1. Crisis (Underestimation) -> Penalty x50.0 (Strong enough to catch spikes, stops overshooting)
-    2. Stable (Overestimation)  -> Penalty x10.0 (Standard suppression for noise)
+    Improvements:
+    1. Softened asymmetric weights (10x/3x instead of 50x/10x)
+    2. Huber Loss for robustness against outliers
+    3. Reduced physics constraint contribution
     """
-    def __init__(self, diff_coeff=0.01, react_coeff=5.0, crisis_threshold=0.25):
+    
+    def __init__(self, diff_coeff=0.01, react_coeff=1.0, crisis_threshold=0.25):
         super(ReactionDiffusionLoss, self).__init__()
-        # Fixed Physics Coefficients
         self.D = diff_coeff
         self.R = react_coeff
         self.threshold = crisis_threshold
-
-    def forward(self, pred, target, inputs):
+        self.huber = nn.SmoothL1Loss(reduction='none')
+    
+    def forward(self, y_pred, y_true, inputs=None):
         """
-        pred: [Batch, 3]
-        target: [Batch, 3]
-        inputs: [Batch, Seq, Feat]
-        """
+        Args:
+            y_pred: [Batch, 3] - Predicted values
+            y_true: [Batch, 3] - Target values
+            inputs: [Batch, Features] - Last timestep input (for reaction term)
         
-        # --- 1. Balanced Asymmetric Data Loss ---
-        residual = target - pred
+        Returns:
+            loss: Scalar tensor
+        """
+        # --- 1. Robust Asymmetric Data Loss ---
+        residual = y_true - y_pred
         
         # Detect Regimes
-        is_crisis = target > self.threshold
-        is_stable = ~is_crisis
+        is_crisis = (y_true > self.threshold).float()
+        is_stable = 1.0 - is_crisis
         
         # Detect Errors
-        is_under = residual > 0 # Prediction < Actual
-        is_over = residual < 0  # Prediction > Actual
+        is_under = (residual > 0).float()  # Prediction < Actual
+        is_over = (residual < 0).float()   # Prediction > Actual
         
+        # Base weights
         weights = torch.ones_like(residual)
         
-        # [Crisis Zone]
-        # Tuned Down: 200.0 -> 50.0
-        # 50x is the "Goldilocks" zone: catches the spike but prevents flying to the moon.
-        weights = torch.where(is_crisis & is_under, 50.0, weights)
+        # [Crisis Zone] - Softened from 50x to 10x
+        crisis_mask = (is_crisis > 0.5) & (is_under > 0.5)
+        weights = torch.where(crisis_mask, torch.tensor(10.0, device=weights.device), weights)
         
-        # [Stable Zone]
-        # Tuned Down: 20.0 -> 10.0
-        # Keeps the baseline clean without suppressing recovery too much.
-        weights = torch.where(is_stable & is_over, 10.0, weights)
+        # [Stable Zone] - Softened from 10x to 3x
+        stable_mask = (is_stable > 0.5) & (is_over > 0.5)
+        weights = torch.where(stable_mask, torch.tensor(3.0, device=weights.device), weights)
         
-        # Calculate Weighted MSE
-        data_loss = torch.mean(weights * (residual ** 2))
+        # Huber Loss: Robust to outliers
+        huber_loss = self.huber(y_pred, y_true)
+        data_loss = torch.mean(weights * huber_loss)
         
-        # --- 2. Physics Constraints ---
+        # --- 2. Physics Constraints (Reduced weight) ---
         
-        # A. Diffusion (Smoothing)
-        v1, v3, v6 = pred[:, 0], pred[:, 1], pred[:, 2]
-        laplacian = v1 - 2*v3 + v6
-        diffusion_term = self.D * torch.mean(laplacian**2)
+        # A. Diffusion (Smoothing) - Reduced contribution
+        v1 = y_pred[:, 0]
+        v3 = y_pred[:, 1]
+        v6 = y_pred[:, 2]
+        laplacian = v1 - 2 * v3 + v6
+        diffusion_term = self.D * torch.mean(laplacian ** 2) * 0.1
         
         # B. Reaction (Excitation)
-        # SKEW-based trigger for "Shape Guidance"
-        skew_scaled = inputs[:, -1]
-        skew_trigger = torch.relu(skew_scaled - 0.6)
-        
-        # Reaction Force
-        # Guided by 'react_coeff' from main.py
-        reaction_force = self.R * skew_trigger * v1
-        reaction_term = torch.mean(reaction_force**2) * 0.01 
+        reaction_term = 0.0
+        if inputs is not None:
+            skew_scaled = inputs[:, -1]
+            skew_trigger = torch.relu(skew_scaled - 0.6)
+            reaction_force = self.R * skew_trigger * v1
+            reaction_term = torch.mean(reaction_force ** 2) * 0.001
         
         return data_loss + diffusion_term + reaction_term
+
+
+def reaction_diffusion_loss_with_inputs(diff_coeff=0.01, react_coeff=1.0, crisis_threshold=0.25):
+    """
+    Factory function returning a loss function for custom training loops.
+    """
+    huber = nn.SmoothL1Loss(reduction='none')
+    
+    def loss_fn(y_pred, y_true, inputs=None):
+        residual = y_true - y_pred
+        
+        # Detect Regimes
+        is_crisis = (y_true > crisis_threshold).float()
+        is_stable = 1.0 - is_crisis
+        
+        # Detect Errors
+        is_under = (residual > 0).float()
+        is_over = (residual < 0).float()
+        
+        # Softened asymmetric weights
+        weights = torch.ones_like(residual)
+        
+        crisis_mask = (is_crisis > 0.5) & (is_under > 0.5)
+        weights = torch.where(crisis_mask, torch.tensor(10.0, device=weights.device), weights)
+        
+        stable_mask = (is_stable > 0.5) & (is_over > 0.5)
+        weights = torch.where(stable_mask, torch.tensor(3.0, device=weights.device), weights)
+        
+        # Huber Loss
+        huber_loss = huber(y_pred, y_true)
+        data_loss = torch.mean(weights * huber_loss)
+        
+        # Physics Constraints (reduced)
+        v1, v3, v6 = y_pred[:, 0], y_pred[:, 1], y_pred[:, 2]
+        laplacian = v1 - 2 * v3 + v6
+        diffusion_term = diff_coeff * torch.mean(laplacian ** 2) * 0.1
+        
+        reaction_term = 0.0
+        if inputs is not None:
+            skew_trigger = torch.relu(inputs[:, -1] - 0.6)
+            reaction_force = react_coeff * skew_trigger * v1
+            reaction_term = torch.mean(reaction_force ** 2) * 0.001
+        
+        return data_loss + diffusion_term + reaction_term
+    
+    return loss_fn
